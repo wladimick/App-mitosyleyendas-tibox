@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import "./tabs.css";
 
 export const metadata: Metadata = {
   title: "Team Cornetas | Mitos y Leyendas",
