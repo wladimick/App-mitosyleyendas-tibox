@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import { createEncounter, fetchEncounters } from "../lib/cloud";
 import {
   calculateMetrics,
   filterEncountersByPeriod,
@@ -11,7 +12,12 @@ import {
   type Period,
   type Side,
 } from "../lib/domain";
-import { clearEncounters, demoEncounters, loadEncounters, saveEncounters } from "../lib/storage";
+import {
+  ACTIVE_PLAYER_STORAGE_KEY,
+  isTeamPlayer,
+  TEAM_PLAYERS,
+  type TeamPlayer,
+} from "../lib/players";
 
 type DraftGame = {
   id: string;
@@ -35,9 +41,11 @@ const periodLabels: Record<Period, string> = {
 };
 
 const formatLabels: Record<EncounterFormat, string> = {
-  lunch: "Almuerzo libre",
+  lunch: "Almuerzo",
   bo3: "BO3 / torneo",
 };
+
+const diceFaces = ["", "⚀", "⚁", "⚂", "⚃", "⚄", "⚅"];
 
 function todayInputValue() {
   const date = new Date();
@@ -56,8 +64,15 @@ function newDraftGame(index: number): DraftGame {
 
 export default function HomePage() {
   const [encounters, setEncounters] = useState<Encounter[]>([]);
-  const [hydrated, setHydrated] = useState(false);
+  const [activePlayer, setActivePlayer] = useState<TeamPlayer | null>(null);
+  const [profileReady, setProfileReady] = useState(false);
   const [period, setPeriod] = useState<Period>("month");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [cloudError, setCloudError] = useState("");
+  const [lastSync, setLastSync] = useState<Date | null>(null);
+  const [diceValue, setDiceValue] = useState<number | null>(null);
+  const [diceRolls, setDiceRolls] = useState(0);
   const [form, setForm] = useState<FormState>({
     date: "",
     format: "lunch",
@@ -71,30 +86,50 @@ export default function HomePage() {
   ]);
   const [formMessage, setFormMessage] = useState("");
 
-  useEffect(() => {
-    setEncounters(loadEncounters());
-    setForm((current) => ({ ...current, date: todayInputValue() }));
-    setHydrated(true);
-  }, []);
+  async function refreshCloud(silent = false) {
+    if (!silent) setLoading(true);
+    try {
+      const data = await fetchEncounters();
+      setEncounters(data);
+      setCloudError("");
+      setLastSync(new Date());
+    } catch (error) {
+      console.error(error);
+      setCloudError("No pudimos sincronizar con Supabase. Revisa la configuración o vuelve a intentar.");
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }
 
   useEffect(() => {
-    if (hydrated) saveEncounters(encounters);
-  }, [encounters, hydrated]);
+    const storedPlayer = window.localStorage.getItem(ACTIVE_PLAYER_STORAGE_KEY);
+    if (isTeamPlayer(storedPlayer)) {
+      setActivePlayer(storedPlayer);
+      setForm((current) => ({ ...current, playerA: storedPlayer }));
+    }
+    setForm((current) => ({ ...current, date: todayInputValue() }));
+    setProfileReady(true);
+    void refreshCloud();
+
+    const interval = window.setInterval(() => void refreshCloud(true), 15_000);
+    const onFocus = () => void refreshCloud(true);
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
 
   const filteredEncounters = useMemo(
     () => filterEncountersByPeriod(encounters, period),
     [encounters, period],
   );
   const metrics = useMemo(() => calculateMetrics(filteredEncounters), [filteredEncounters]);
-
-  const playerSuggestions = useMemo(
-    () =>
-      Array.from(
-        new Set(encounters.flatMap((item) => [normalize(item.playerA), normalize(item.playerB)])),
-      ).filter(Boolean),
-    [encounters],
+  const activeStats = useMemo(
+    () => metrics.players.find((player) => player.name === activePlayer),
+    [activePlayer, metrics.players],
   );
-
   const raceSuggestions = useMemo(
     () =>
       Array.from(
@@ -102,7 +137,6 @@ export default function HomePage() {
       ).filter(Boolean),
     [encounters],
   );
-
   const sortedEncounters = useMemo(
     () =>
       [...filteredEncounters].sort(
@@ -110,6 +144,28 @@ export default function HomePage() {
       ),
     [filteredEncounters],
   );
+
+  function choosePlayer(player: TeamPlayer) {
+    window.localStorage.setItem(ACTIVE_PLAYER_STORAGE_KEY, player);
+    setActivePlayer(player);
+    setForm((current) => ({
+      ...current,
+      playerA: player,
+      playerB: current.playerB === player ? "" : current.playerB,
+    }));
+  }
+
+  function changePlayer() {
+    window.localStorage.removeItem(ACTIVE_PLAYER_STORAGE_KEY);
+    setActivePlayer(null);
+    setDiceValue(null);
+  }
+
+  function rollDice() {
+    const next = Math.floor(Math.random() * 6) + 1;
+    setDiceValue(next);
+    setDiceRolls((current) => current + 1);
+  }
 
   function updateGame(id: string, field: "diceWinner" | "winner", value: Side) {
     setGames((current) =>
@@ -123,12 +179,19 @@ export default function HomePage() {
   }
 
   function removeGame(id: string) {
-    setGames((current) => (current.length === 1 ? current : current.filter((game) => game.id !== id)));
+    setGames((current) =>
+      current.length === 1 ? current : current.filter((game) => game.id !== id),
+    );
   }
 
-  function submitEncounter(event: FormEvent<HTMLFormElement>) {
+  async function submitEncounter(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormMessage("");
+
+    if (!activePlayer) {
+      setFormMessage("Selecciona tu perfil antes de registrar una partida.");
+      return;
+    }
 
     const cleaned = {
       playerA: normalize(form.playerA),
@@ -142,51 +205,78 @@ export default function HomePage() {
       return;
     }
 
-    if (cleaned.playerA.toLocaleLowerCase() === cleaned.playerB.toLocaleLowerCase()) {
+    if (cleaned.playerA === cleaned.playerB) {
       setFormMessage("Los dos lados deben corresponder a jugadores distintos.");
       return;
     }
 
-    const encounter: Encounter = {
-      id: makeId("encounter"),
-      date: form.date,
-      format: form.format,
-      playerA: cleaned.playerA,
-      raceA: cleaned.raceA,
-      playerB: cleaned.playerB,
-      raceB: cleaned.raceB,
-      createdAt: new Date().toISOString(),
-      games: games.map((game) => ({
-        id: makeId("game"),
-        diceWinner: game.diceWinner,
-        winner: game.winner,
-      })),
-    };
+    setSaving(true);
+    try {
+      await createEncounter(
+        {
+          date: form.date,
+          format: form.format,
+          playerA: cleaned.playerA,
+          raceA: cleaned.raceA,
+          playerB: cleaned.playerB,
+          raceB: cleaned.raceB,
+          games: games.map((game) => ({
+            id: makeId("game"),
+            diceWinner: game.diceWinner,
+            winner: game.winner,
+          })),
+        },
+        activePlayer,
+      );
 
-    setEncounters((current) => [encounter, ...current]);
-    setGames([{ id: makeId("draft"), diceWinner: "a", winner: "a" }]);
-    setForm((current) => ({
-      ...current,
-      playerA: "",
-      raceA: "",
-      playerB: "",
-      raceB: "",
-    }));
-    setFormMessage(`Guardado: ${encounter.games.length} juego${encounter.games.length === 1 ? "" : "s"}.`);
+      await refreshCloud(true);
+      setGames([{ id: makeId("draft"), diceWinner: "a", winner: "a" }]);
+      setForm((current) => ({
+        ...current,
+        playerA: activePlayer,
+        raceA: "",
+        playerB: "",
+        raceB: "",
+      }));
+      setFormMessage(`Guardado en la nube: ${games.length} juego${games.length === 1 ? "" : "s"}.`);
+    } catch (error) {
+      console.error(error);
+      setFormMessage(
+        "No se pudo guardar. Si recién configuraste Supabase, ejecuta 002_public_player_mode.sql.",
+      );
+    } finally {
+      setSaving(false);
+    }
   }
 
-  function deleteEncounter(id: string) {
-    setEncounters((current) => current.filter((encounter) => encounter.id !== id));
-  }
+  if (!profileReady) return null;
 
-  function loadDemo() {
-    setEncounters(demoEncounters);
-    setPeriod("today");
-  }
-
-  function resetAll() {
-    clearEncounters();
-    setEncounters([]);
+  if (!activePlayer) {
+    return (
+      <main className="welcome-shell">
+        <div className="welcome-glow glow-one" />
+        <div className="welcome-glow glow-two" />
+        <section className="welcome-card">
+          <div className="brand-mark large">TC</div>
+          <p className="eyebrow">Mitos y Leyendas · Team Cornetas</p>
+          <h1>¿Quién está jugando?</h1>
+          <p className="welcome-copy">
+            No necesitas contraseña. Elige tu perfil y la app lo recordará en este dispositivo.
+          </p>
+          <div className="profile-grid">
+            {TEAM_PLAYERS.map((player) => (
+              <button className="profile-button" key={player} onClick={() => choosePlayer(player)}>
+                <span>{player.slice(0, 1)}</span>
+                <strong>{player}</strong>
+              </button>
+            ))}
+          </div>
+          <small className="welcome-note">
+            Los perfiles identifican quién registra la partida; no son cuentas con autenticación.
+          </small>
+        </section>
+      </main>
+    );
   }
 
   return (
@@ -199,62 +289,77 @@ export default function HomePage() {
             <h1>Team Cornetas</h1>
           </div>
         </div>
-        <div className="status-pill" title="En esta primera versión los datos viven en este navegador">
-          <span className="status-dot" /> MVP local
+
+        <div className="top-actions">
+          <button className="dice-trigger" type="button" onClick={rollDice}>
+            <span>🎲</span> Dado
+          </button>
+          <div className="cloud-status" title={lastSync ? `Última sincronización ${lastSync.toLocaleTimeString("es-CL")}` : "Conectando"}>
+            <span className={cloudError ? "status-dot error" : "status-dot"} />
+            {cloudError ? "Sin conexión" : "Nube"}
+          </div>
+          <button className="player-menu" type="button" onClick={changePlayer} title="Cambiar jugador">
+            <span className="avatar">{activePlayer.slice(0, 1)}</span>
+            <span>
+              <small>Jugando como</small>
+              <strong>{activePlayer}</strong>
+            </span>
+          </button>
         </div>
       </header>
 
+      {diceValue && (
+        <section className="dice-banner" key={diceRolls}>
+          <div className="dice-face">{diceFaces[diceValue]}</div>
+          <div>
+            <span>Resultado del dado</span>
+            <strong>{diceValue}</strong>
+          </div>
+          <button type="button" onClick={rollDice}>Tirar otra vez</button>
+          <button className="dice-close" type="button" onClick={() => setDiceValue(null)} aria-label="Cerrar dado">×</button>
+        </section>
+      )}
+
       <section className="hero-panel">
-        <div>
+        <div className="hero-copy-block">
           <p className="eyebrow">Winrate del team</p>
-          <h2>Que el dado no decida la historia.</h2>
+          <h2>El almuerzo ahora tiene estadísticas.</h2>
           <p className="hero-copy">
-            Registra cada encuentro del almuerzo o un BO3 completo. La app separa cada juego para
-            medir rendimiento real por jugador, raza y ventaja de dado.
+            Registra cada juego, compara jugadores y razas, y descubre cuánto influye realmente ganar el dado.
           </p>
         </div>
-        <div className="hero-actions">
-          <button className="button secondary" type="button" onClick={loadDemo}>
-            Cargar demo
-          </button>
-          {encounters.length > 0 && (
-            <button className="button ghost" type="button" onClick={resetAll}>
-              Limpiar datos
-            </button>
-          )}
+        <div className="hero-player-stat">
+          <span>Tu rendimiento · {periodLabels[period]}</span>
+          <strong>{activeStats ? `${activeStats.winrate}%` : "—"}</strong>
+          <small>{activeStats ? `${activeStats.wins}V · ${activeStats.losses}D · ${activeStats.games} juegos` : "Aún sin partidas en este período"}</small>
         </div>
       </section>
 
-      <section className="period-switch" aria-label="Período de estadísticas">
-        {(Object.keys(periodLabels) as Period[]).map((key) => (
-          <button
-            key={key}
-            className={period === key ? "active" : ""}
-            type="button"
-            onClick={() => setPeriod(key)}
-          >
-            {periodLabels[key]}
-          </button>
-        ))}
+      {cloudError && (
+        <div className="alert error-alert">
+          <span>{cloudError}</span>
+          <button type="button" onClick={() => void refreshCloud()}>Reintentar</button>
+        </div>
+      )}
+
+      <section className="period-bar">
+        <div className="period-switch" aria-label="Período de estadísticas">
+          {(Object.keys(periodLabels) as Period[]).map((key) => (
+            <button key={key} className={period === key ? "active" : ""} type="button" onClick={() => setPeriod(key)}>
+              {periodLabels[key]}
+            </button>
+          ))}
+        </div>
+        <button className="refresh-button" type="button" onClick={() => void refreshCloud()} disabled={loading}>
+          {loading ? "Sincronizando…" : "↻ Actualizar"}
+        </button>
       </section>
 
       <section className="metrics-grid">
         <MetricCard label="Juegos" value={metrics.games.toString()} helper={`${metrics.encounters} encuentros`} />
-        <MetricCard
-          label="Ventaja del dado"
-          value={`${metrics.diceAdvantage}%`}
-          helper={`${metrics.diceWinnerGameWins} juegos ganados por quien ganó el dado`}
-        />
-        <MetricCard
-          label="Líder"
-          value={metrics.players[0]?.name ?? "—"}
-          helper={metrics.players[0] ? `${metrics.players[0].winrate}% winrate` : "Sin partidas todavía"}
-        />
-        <MetricCard
-          label="Raza líder"
-          value={metrics.races[0]?.race ?? "—"}
-          helper={metrics.races[0] ? `${metrics.races[0].winrate}% winrate` : "Sin datos todavía"}
-        />
+        <MetricCard label="Ventaja del dado" value={`${metrics.diceAdvantage}%`} helper={`${metrics.diceWinnerGameWins} ganados por quien ganó el dado`} />
+        <MetricCard label="Líder" value={metrics.players[0]?.name ?? "—"} helper={metrics.players[0] ? `${metrics.players[0].winrate}% winrate` : "Sin partidas todavía"} />
+        <MetricCard label="Raza líder" value={metrics.races[0]?.race ?? "—"} helper={metrics.races[0] ? `${metrics.races[0].winrate}% winrate` : "Sin datos todavía"} />
       </section>
 
       <section className="content-grid">
@@ -271,20 +376,11 @@ export default function HomePage() {
             <div className="field-grid two">
               <label>
                 Fecha
-                <input
-                  type="date"
-                  value={form.date}
-                  onChange={(event) => setForm({ ...form, date: event.target.value })}
-                />
+                <input type="date" value={form.date} onChange={(event) => setForm({ ...form, date: event.target.value })} />
               </label>
               <label>
                 Formato
-                <select
-                  value={form.format}
-                  onChange={(event) =>
-                    setForm({ ...form, format: event.target.value as EncounterFormat })
-                  }
-                >
+                <select value={form.format} onChange={(event) => setForm({ ...form, format: event.target.value as EncounterFormat })}>
                   <option value="lunch">Almuerzo libre</option>
                   <option value="bo3">BO3 / torneo</option>
                 </select>
@@ -296,21 +392,13 @@ export default function HomePage() {
                 <span className="player-side">A</span>
                 <label>
                   Jugador
-                  <input
-                    list="players"
-                    placeholder="Nombre"
-                    value={form.playerA}
-                    onChange={(event) => setForm({ ...form, playerA: event.target.value })}
-                  />
+                  <select value={form.playerA} onChange={(event) => setForm({ ...form, playerA: event.target.value, playerB: form.playerB === event.target.value ? "" : form.playerB })}>
+                    {TEAM_PLAYERS.map((player) => <option key={player} value={player}>{player}</option>)}
+                  </select>
                 </label>
                 <label>
                   Raza / mazo
-                  <input
-                    list="races"
-                    placeholder="Ej. Guerrero"
-                    value={form.raceA}
-                    onChange={(event) => setForm({ ...form, raceA: event.target.value })}
-                  />
+                  <input list="races" placeholder="Ej. Guerrero" value={form.raceA} onChange={(event) => setForm({ ...form, raceA: event.target.value })} />
                 </label>
               </div>
 
@@ -320,50 +408,29 @@ export default function HomePage() {
                 <span className="player-side">B</span>
                 <label>
                   Jugador
-                  <input
-                    list="players"
-                    placeholder="Nombre"
-                    value={form.playerB}
-                    onChange={(event) => setForm({ ...form, playerB: event.target.value })}
-                  />
+                  <select value={form.playerB} onChange={(event) => setForm({ ...form, playerB: event.target.value })}>
+                    <option value="">Seleccionar rival</option>
+                    {TEAM_PLAYERS.filter((player) => player !== form.playerA).map((player) => <option key={player} value={player}>{player}</option>)}
+                  </select>
                 </label>
                 <label>
                   Raza / mazo
-                  <input
-                    list="races"
-                    placeholder="Ej. Bestia"
-                    value={form.raceB}
-                    onChange={(event) => setForm({ ...form, raceB: event.target.value })}
-                  />
+                  <input list="races" placeholder="Ej. Bestia" value={form.raceB} onChange={(event) => setForm({ ...form, raceB: event.target.value })} />
                 </label>
               </div>
             </div>
 
-            <datalist id="players">
-              {playerSuggestions.map((player) => (
-                <option key={player} value={player} />
-              ))}
-            </datalist>
             <datalist id="races">
-              {raceSuggestions.map((race) => (
-                <option key={race} value={race} />
-              ))}
+              {raceSuggestions.map((race) => <option key={race} value={race} />)}
             </datalist>
 
             <div className="games-block">
               <div className="games-heading">
                 <div>
                   <span className="field-title">Resultados</span>
-                  <small>Ganador del dado y ganador de cada juego.</small>
+                  <small>Registra quién ganó el dado y quién ganó cada juego.</small>
                 </div>
-                <button
-                  className="text-button"
-                  type="button"
-                  onClick={addGame}
-                  disabled={games.length >= 3}
-                >
-                  + Agregar juego
-                </button>
+                <button className="text-button" type="button" onClick={addGame} disabled={games.length >= 3}>+ Agregar juego</button>
               </div>
 
               {games.map((game, index) => (
@@ -371,41 +438,27 @@ export default function HomePage() {
                   <strong>J{index + 1}</strong>
                   <label>
                     Ganó el dado
-                    <select
-                      value={game.diceWinner}
-                      onChange={(event) => updateGame(game.id, "diceWinner", event.target.value as Side)}
-                    >
+                    <select value={game.diceWinner} onChange={(event) => updateGame(game.id, "diceWinner", event.target.value as Side)}>
                       <option value="a">{form.playerA || "Jugador A"}</option>
                       <option value="b">{form.playerB || "Jugador B"}</option>
                     </select>
                   </label>
                   <label>
                     Ganó el juego
-                    <select
-                      value={game.winner}
-                      onChange={(event) => updateGame(game.id, "winner", event.target.value as Side)}
-                    >
+                    <select value={game.winner} onChange={(event) => updateGame(game.id, "winner", event.target.value as Side)}>
                       <option value="a">{form.playerA || "Jugador A"}</option>
                       <option value="b">{form.playerB || "Jugador B"}</option>
                     </select>
                   </label>
-                  <button
-                    className="icon-button"
-                    type="button"
-                    onClick={() => removeGame(game.id)}
-                    disabled={games.length === 1}
-                    aria-label={`Eliminar juego ${index + 1}`}
-                  >
-                    ×
-                  </button>
+                  <button className="icon-button" type="button" onClick={() => removeGame(game.id)} disabled={games.length === 1} aria-label={`Eliminar juego ${index + 1}`}>×</button>
                 </div>
               ))}
             </div>
 
-            {formMessage && <p className="form-message">{formMessage}</p>}
+            {formMessage && <p className={formMessage.startsWith("Guardado") ? "form-message success" : "form-message"}>{formMessage}</p>}
 
-            <button className="button primary full" type="submit">
-              Guardar encuentro
+            <button className="button primary full" type="submit" disabled={saving}>
+              {saving ? "Guardando…" : "Guardar encuentro"}
             </button>
           </form>
         </article>
@@ -419,24 +472,22 @@ export default function HomePage() {
             <span className="panel-badge">{periodLabels[period]}</span>
           </div>
 
-          {metrics.players.length === 0 ? (
-            <EmptyState text="Registra el primer juego o carga la demo para ver el ranking." />
+          {loading && encounters.length === 0 ? (
+            <EmptyState text="Sincronizando partidas…" />
+          ) : metrics.players.length === 0 ? (
+            <EmptyState text="Todavía no hay partidas registradas en este período." />
           ) : (
             <div className="ranking-list">
               {metrics.players.map((player, index) => (
-                <div className="ranking-row" key={player.name}>
+                <div className={`ranking-row ${player.name === activePlayer ? "is-me" : ""}`} key={player.name}>
                   <span className={`rank rank-${index + 1}`}>{index + 1}</span>
                   <div className="ranking-name">
-                    <strong>{player.name}</strong>
-                    <small>
-                      {player.wins}V · {player.losses}D · {player.games} juegos
-                    </small>
+                    <strong>{player.name}{player.name === activePlayer ? " · tú" : ""}</strong>
+                    <small>{player.wins}V · {player.losses}D · {player.games} juegos</small>
                   </div>
                   <div className="winrate-block">
                     <strong>{player.winrate}%</strong>
-                    <div className="progress-track">
-                      <span style={{ width: `${player.winrate}%` }} />
-                    </div>
+                    <div className="progress-track"><span style={{ width: `${player.winrate}%` }} /></div>
                   </div>
                 </div>
               ))}
@@ -458,23 +509,11 @@ export default function HomePage() {
           ) : (
             <div className="table-wrap">
               <table>
-                <thead>
-                  <tr>
-                    <th>Raza</th>
-                    <th>Juegos</th>
-                    <th>V</th>
-                    <th>D</th>
-                    <th>WR</th>
-                  </tr>
-                </thead>
+                <thead><tr><th>Raza</th><th>Juegos</th><th>V</th><th>D</th><th>WR</th></tr></thead>
                 <tbody>
                   {metrics.races.map((race) => (
                     <tr key={race.race}>
-                      <td><strong>{race.race}</strong></td>
-                      <td>{race.games}</td>
-                      <td>{race.wins}</td>
-                      <td>{race.losses}</td>
-                      <td><span className="wr-chip">{race.winrate}%</span></td>
+                      <td><strong>{race.race}</strong></td><td>{race.games}</td><td>{race.wins}</td><td>{race.losses}</td><td><span className="wr-chip">{race.winrate}%</span></td>
                     </tr>
                   ))}
                 </tbody>
@@ -498,27 +537,13 @@ export default function HomePage() {
                 const score = scoreEncounter(encounter);
                 return (
                   <div className="encounter-row" key={encounter.id}>
-                    <div className="encounter-meta">
-                      <span>{encounter.date}</span>
-                      <span>{formatLabels[encounter.format]}</span>
-                    </div>
+                    <div className="encounter-meta"><span>{encounter.date}</span><span>{formatLabels[encounter.format]}</span></div>
                     <div className="encounter-main">
-                      <div className={score.a > score.b ? "winner" : ""}>
-                        <strong>{encounter.playerA}</strong>
-                        <small>{encounter.raceA}</small>
-                      </div>
+                      <div className={score.a > score.b ? "winner" : ""}><strong>{encounter.playerA}</strong><small>{encounter.raceA}</small></div>
                       <div className="score-box">{score.a} : {score.b}</div>
-                      <div className={score.b > score.a ? "winner right" : "right"}>
-                        <strong>{encounter.playerB}</strong>
-                        <small>{encounter.raceB}</small>
-                      </div>
+                      <div className={score.b > score.a ? "winner right" : "right"}><strong>{encounter.playerB}</strong><small>{encounter.raceB}</small></div>
                     </div>
-                    <div className="encounter-footer">
-                      <span>{encounter.games.length} juego{encounter.games.length === 1 ? "" : "s"}</span>
-                      <button className="danger-link" type="button" onClick={() => deleteEncounter(encounter.id)}>
-                        Eliminar
-                      </button>
-                    </div>
+                    <div className="encounter-footer"><span>{encounter.games.length} juego{encounter.games.length === 1 ? "" : "s"}</span><span>Compartido en la nube</span></div>
                   </div>
                 );
               })}
@@ -527,23 +552,13 @@ export default function HomePage() {
         </article>
       </section>
 
-      <footer>
-        <strong>Team Cornetas</strong>
-        <span>·</span>
-        <span>MVP de estadísticas MyL</span>
-      </footer>
+      <footer><strong>Team Cornetas</strong><span>·</span><span>Winrate MyL</span></footer>
     </main>
   );
 }
 
 function MetricCard({ label, value, helper }: { label: string; value: string; helper: string }) {
-  return (
-    <article className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <small>{helper}</small>
-    </article>
-  );
+  return <article className="metric-card"><span>{label}</span><strong>{value}</strong><small>{helper}</small></article>;
 }
 
 function EmptyState({ text }: { text: string }) {
